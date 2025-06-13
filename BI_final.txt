@@ -1,0 +1,126 @@
+import streamlit as st
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+import matplotlib
+from st_aggrid import AgGrid, GridOptionsBuilder
+
+# 中文字體設定
+matplotlib.rcParams['font.family'] = 'Microsoft JhengHei'
+matplotlib.rcParams['axes.unicode_minus'] = False
+
+# 頁面標題
+st.title("顧客購買行為分析儀表板")
+
+# 資料讀取
+rfm = pd.read_csv("rfm.csv")
+df = pd.read_csv("transactions.csv")
+
+# 分群名稱對應
+cluster_name_map = {
+    0: '高價值顧客',
+    1: '沉睡顧客',
+    2: '潛力型顧客',
+    3: '偶爾型顧客'
+}
+rfm['ClusterLabel'] = rfm['Cluster'].map(cluster_name_map)
+
+# 分群總覽
+st.header("📊 各群組平均 RFM 值")
+cluster_summary = rfm.groupby('ClusterLabel')[['Recency', 'Frequency', 'Monetary']].mean().round(2)
+st.dataframe(cluster_summary)
+
+# 顧客分群視覺化（PCA）
+st.header("🎯 顧客分群散點圖 (PCA)")
+fig, ax = plt.subplots()
+sns.scatterplot(data=rfm, x='PCA1', y='PCA2', hue='ClusterLabel', palette='Set2', alpha=0.6, ax=ax)
+st.pyplot(fig)
+
+# 每群第一名熱門商品類別和購買數量
+st.header("🛒 各群最熱門商品分類及購買數量")
+top1_categories = (
+    df.merge(rfm[['CustomerID', 'Cluster', 'ClusterLabel']], on='CustomerID')
+    .groupby(['ClusterLabel', 'ProductCategory'])
+    .size()
+    .reset_index(name='Count')
+    .sort_values(['ClusterLabel', 'Count'], ascending=[True, False])
+    .groupby('ClusterLabel')
+    .first()
+    .reset_index()
+    .rename(columns={
+        'ProductCategory': '第一名商品',
+        'Count': '第一名數量'
+    })
+)
+st.dataframe(top1_categories)
+
+# 每位顧客購買最多的商品類別
+top_category_per_customer = (
+    df.groupby(['CustomerID', 'ProductCategory'])
+    .size()
+    .reset_index(name='Count')
+    .sort_values(['CustomerID', 'Count'], ascending=[True, False])
+    .groupby('CustomerID')
+    .first()
+    .reset_index()
+    .rename(columns={'ProductCategory': 'TopCategory'})
+)
+
+# 合併到 rfm
+rfm_with_topcat = rfm.merge(top_category_per_customer[['CustomerID', 'TopCategory']], on='CustomerID', how='left')
+
+# 顯示群組顧客明細 + 點選後推薦
+st.header("🔍 群組顧客明細與推薦")
+selected_label = st.selectbox("請選擇顧客群組：", rfm['ClusterLabel'].unique())
+
+filtered_customers = rfm_with_topcat[rfm_with_topcat['ClusterLabel'] == selected_label]
+cols_to_show = ['CustomerID', 'Recency', 'Frequency', 'Monetary', 'TopCategory']
+
+# 使用 AgGrid 顯示可選擇資料表
+gb = GridOptionsBuilder.from_dataframe(filtered_customers[cols_to_show])
+gb.configure_selection('single', use_checkbox=True)
+grid_options = gb.build()
+
+grid_response = AgGrid(filtered_customers[cols_to_show], gridOptions=grid_options, height=300)
+
+# 個人化推薦顯示區塊
+selected_rows = grid_response.get('selected_rows')
+
+if selected_rows is not None and not selected_rows.empty:
+    selected_row = selected_rows.iloc[0]  # 取得第一筆選擇的列
+    customer_id = selected_row['CustomerID']
+    top_cat = selected_row['TopCategory']
+
+    # 該顧客所在群組
+    customer_cluster_label = rfm_with_topcat.loc[rfm_with_topcat['CustomerID'] == customer_id, 'ClusterLabel'].values[0]
+
+    # 該群組熱門商品類別排行（不包含顧客 TopCategory）
+    cluster_top_categories = (
+        df.merge(rfm[['CustomerID', 'ClusterLabel']], on='CustomerID')
+        .query("ClusterLabel == @customer_cluster_label")
+        .groupby('ProductCategory')
+        .size()
+        .reset_index(name='Count')
+        .sort_values('Count', ascending=False)
+    )
+    cluster_top_categories = cluster_top_categories[cluster_top_categories['ProductCategory'] != top_cat]
+
+    # 取前三名
+    recommended_categories = cluster_top_categories.head(1)['ProductCategory'].tolist()
+
+    # 若不夠三個，補全全體熱門類別（排除TopCategory和已推薦的）
+    if len(recommended_categories) < 1:
+        all_top_categories = (
+            df.groupby('ProductCategory')
+            .size()
+            .reset_index(name='Count')
+            .sort_values('Count', ascending=False)
+        )
+        exclude_list = [top_cat] + recommended_categories
+        more_cats = all_top_categories[~all_top_categories['ProductCategory'].isin(exclude_list)].head(1 - len(recommended_categories))['ProductCategory'].tolist()
+        recommended_categories += more_cats
+
+    # 顯示推薦結果
+
+    st.subheader("🎁 個人化推薦")
+    st.markdown(f"**針對顧客 `{customer_id}` 的購買偏好，推薦更多 `{top_cat}`、`{', '.join(recommended_categories)}` 類別的商品**")
